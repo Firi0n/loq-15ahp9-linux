@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# dgpu - show the NVIDIA dGPU power state without waking it up.
+#
+# Only runtime-PM-safe reads: <dev>/power/*, <dev>/power_state, <dev>/drm/,
+# /sys/class/power_supply/*, fuser. NEVER add any of these, they wake the GPU:
+#   lspci (even without flags), nvidia-smi, nvtop, prime-run, glxinfo,
+#   vulkaninfo, /sys/class/drm/cardN-*/{status,edid,modes},
+#   /sys/bus/pci/devices/<BDF>/config
+
+set -uo pipefail
+
+usage() {
+	cat <<'EOF'
+Usage: dgpu [-w | -h]
+
+Show the NVIDIA dGPU power state without waking it up.
+  (none)  one line: state, time active since boot, battery draw
+  -w      watch: log every state change and keep the status line updated;
+          Ctrl+C prints the wake-ups and the time spent active
+  -h      show this help
+
+Exit status: 0 if the GPU is suspended, 1 if it is not, 2 on errors.
+Without root only your own processes are visible: run it with sudo to
+also see system services that open the GPU.
+EOF
+}
+
+die() { printf 'dgpu: %s\n' "$*" >&2; exit 2; }
+
+watch=0
+case "${1:-}" in
+"") ;;
+-w) watch=1 ;;
+-h | --help) usage; exit 0 ;;
+*) die "unknown option: $1 (see -h)" ;;
+esac
+(($# <= 1)) || die "too many arguments (see -h)"
+
+tty=0
+[[ -t 1 ]] && tty=1
+if ((tty)) && [[ -z ${NO_COLOR:-} ]]; then
+	OFF=$'\e[32m' ON=$'\e[33m' RST=$'\e[0m'
+else
+	OFF="" ON="" RST=""
+fi
+
+dev=""
+for d in /sys/bus/pci/devices/*; do
+	[[ $(<"$d/vendor") == 0x10de && $(<"$d/class") == 0x030[02]* ]] && { dev=$d; break; }
+done
+[[ -n $dev ]] || die "no NVIDIA GPU found"
+
+bat=""
+for p in /sys/class/power_supply/*; do
+	[[ $(<"$p/type") == Battery ]] && { bat=$p; break; }
+done
+
+paint() { # green when powered down, yellow otherwise
+	if [[ $1 == suspended || $1 == D3* ]]; then printf '%s%s%s' "$OFF" "$1" "$RST"
+	else printf '%s%s%s' "$ON" "$1" "$RST"; fi
+}
+
+fmt_ms() { # 10612 -> 10.6s, 83456 -> 1m 23s
+	local s=$(($1 / 1000))
+	if ((s < 60)); then printf '%d.%ds' "$s" $((($1 % 1000) / 100))
+	elif ((s < 3600)); then printf '%dm %02ds' $((s / 60)) $((s % 60))
+	else printf '%dh %02dm' $((s / 3600)) $((s % 3600 / 60)); fi
+}
+
+active_ms() { printf '%s' "$(<"$dev/power/runtime_active_time")"; }
+now_ms() { local t=${EPOCHREALTIME/[.,]/}; printf '%s' $((t / 1000)); }
+
+holders() { # names of processes with the GPU open, one per line (for -w)
+	local pid
+	# fuser prints PIDs (with access letters) on stdout, file names on stderr
+	for pid in $(fuser /dev/nvidia* "$dev"/drm/card* "$dev"/drm/renderD* 2>/dev/null | tr -cs '0-9' ' '); do
+		cat "/proc/$pid/comm" 2>/dev/null
+	done | sort -u
+}
+
+join() { paste -sd, - | sed 's/,/, /g'; }
+
+status_line() {
+	local st ps line uw w
+	st=$(<"$dev/power/runtime_status") ps=$(<"$dev/power_state")
+	line="$(paint "$st") $(paint "$ps") | active $(fmt_ms "$(active_ms)")"
+	if [[ -n $bat ]]; then
+		uw=$(<"$bat/power_now")
+		w="$((uw / 1000000)).$((uw % 1000000 / 100000)) W"
+		case $(<"$bat/status") in
+		Discharging) line+=" | $w on battery" ;;
+		Charging) line+=" | AC, charging at $w" ;;
+		*) line+=" | AC" ;;
+		esac
+	fi
+	printf '%s' "$line"
+}
+
+if ((!watch)); then
+	status_line
+	printf '\n'
+	[[ $(<"$dev/power/runtime_status") == suspended ]]
+	exit
+fi
+
+# ---------- watch ----------
+prev="" wakes=0 wake_a=0 a0=$(active_ms) t0=$(now_ms) tick=0 base=$(holders)
+
+finish() {
+	local el act
+	el=$(($(now_ms) - t0)) act=$(($(active_ms) - a0))
+	((tty)) && printf '\r\e[K\e[?7h'
+	printf 'watched %s: %d wake-up%s, %s active (%d%%)\n' "$(fmt_ms "$el")" "$wakes" \
+		"$( ((wakes == 1)) || echo s)" "$(fmt_ms "$act")" $((el > 0 ? act * 100 / el : 0))
+	exit 0
+}
+trap finish INT TERM
+((tty)) && printf '\e[?7l' # no line wrap, so \r always lands on the status line
+
+while :; do
+	st=$(<"$dev/power/runtime_status")
+	# resuming/suspending are transient: only settled states are events
+	if [[ ($st == active || $st == suspended) && $st != "$prev" ]]; then
+		ev="$(date +%T)  $(paint "$st")"
+		if [[ $st == active ]]; then
+			wake_a=$(active_ms)
+			[[ -n $prev ]] && ((wakes++))
+			# who woke it: holders that weren't there when the watch started
+			# unknown: firmware/kernel, or a process that closed it within 0.5s
+			new=$(comm -13 <(printf '%s\n' "$base") <(holders) | join)
+			[[ -n $prev ]] && ev+="  ← ${new:-unknown}"
+		elif [[ -n $prev ]]; then
+			ev+="  (active $(fmt_ms $(($(active_ms) - wake_a))))"
+		fi
+		((tty)) && printf '\r\e[K'
+		printf '%s\n' "$ev"
+		prev=$st tick=0
+	fi
+	((tty && tick % 2 == 0)) && printf '\r\e[K%s' "$(status_line)"
+	((tick++))
+	sleep 0.5
+done
